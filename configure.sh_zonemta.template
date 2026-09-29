@@ -1,0 +1,380 @@
+#!/usr/bin/env bash
+# ZonePMTA (ZoneMTA) configure — extract bundled node_modules (no npm on VPS).
+# Aligned with Haraka/PMTA SMTP ingest: VERP + strip Received/leak + real DKIM.
+echo 'CONFIGURE_FAIL_1' > /tmp/configure.result
+
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: 请使用 root 权限运行"
+    echo 'CONFIGURE_FAIL_43' > /tmp/configure.result
+    exit 43
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+hostnamectl set-hostname {{FULL_DOMAIN}} 2>/dev/null || true
+sed -i 's/^127\.0\.0\.1.*/127.0.0.1 localhost {{FULL_DOMAIN}}\n{{INTERNAL_IP}} {{SUBDOMAIN}} {{FULL_DOMAIN}}/' /etc/hosts
+timedatectl set-timezone Asia/Tokyo 2>/dev/null || true
+
+apt-get update -y
+apt-get install -y curl gnupg ca-certificates redis-server
+
+if ! command -v node >/dev/null 2>&1; then
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    apt-get install -y nodejs
+fi
+if ! command -v node >/dev/null 2>&1; then
+    echo "ERROR: node 未安装"
+    echo 'CONFIGURE_FAIL_42' > /tmp/configure.result
+    exit 42
+fi
+NODE_BIN="$(command -v node)"
+
+. /etc/os-release 2>/dev/null || true
+CODENAME="${VERSION_CODENAME:-jammy}"
+if ! command -v mongod >/dev/null 2>&1 && ! systemctl list-unit-files | grep -q '^mongod'; then
+    curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
+    echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu ${CODENAME}/mongodb-org/7.0 multiverse" > /etc/apt/sources.list.d/mongodb-org-7.0.list
+    apt-get update -y
+    apt-get install -y mongodb-org || apt-get install -y mongodb || true
+fi
+
+systemctl enable redis-server 2>/dev/null || systemctl enable redis 2>/dev/null || true
+systemctl start redis-server 2>/dev/null || systemctl start redis 2>/dev/null || true
+systemctl enable mongod 2>/dev/null || systemctl enable mongodb 2>/dev/null || true
+systemctl start mongod 2>/dev/null || systemctl start mongodb 2>/dev/null || true
+
+systemctl stop zonemta 2>/dev/null || true
+systemctl stop haraka 2>/dev/null || true
+systemctl stop pmta 2>/dev/null || true
+systemctl stop pmtahttp 2>/dev/null || true
+for svc in postfix sendmail exim4 exim; do
+    systemctl stop "$svc" 2>/dev/null || true
+    systemctl disable "$svc" 2>/dev/null || true
+done
+pkill -f 'node haraka.js' 2>/dev/null || true
+pkill -f '/opt/zone-mta/index.js' 2>/dev/null || true
+sleep 1
+
+BUNDLE_URL='{{BUNDLE_URL}}'
+BUNDLE_SHA256='{{BUNDLE_SHA256}}'
+BUNDLE_PRELOADED='{{BUNDLE_PRELOADED}}'
+APP=/opt/zone-mta
+BUNDLE_TAR=/tmp/zonemta-bundle.tar.gz
+rm -f "$BUNDLE_TAR"
+
+if [ -n "$BUNDLE_PRELOADED" ] && [ -f "$BUNDLE_PRELOADED" ]; then
+    echo "使用已上传 bundle: $BUNDLE_PRELOADED"
+    cp "$BUNDLE_PRELOADED" "$BUNDLE_TAR" || {
+        echo "ERROR: 复制预上传 bundle 失败"
+        echo 'CONFIGURE_FAIL_42' > /tmp/configure.result
+        exit 42
+    }
+else
+    DOWNLOAD_OK=0
+    for i in 1 2 3; do
+        echo "Bundle 下载尝试 $i/3..."
+        rm -f "$BUNDLE_TAR"
+        if [ -n "$BUNDLE_URL" ] && wget -4 -q -L --timeout=120 --tries=1 -O "$BUNDLE_TAR" "$BUNDLE_URL"; then
+            if [ -s "$BUNDLE_TAR" ]; then
+                DOWNLOAD_OK=1
+                break
+            fi
+        fi
+        echo "第 $i 次下载失败"
+        [ $i -lt 3 ] && sleep 3
+    done
+    if [ "$DOWNLOAD_OK" != "1" ]; then
+        echo "ERROR: zonemta bundle 下载失败（且无预上传文件）"
+        echo 'CONFIGURE_FAIL_42' > /tmp/configure.result
+        exit 42
+    fi
+fi
+
+ACTUAL_SHA256=$(sha256sum "$BUNDLE_TAR" | awk '{print $1}')
+if [ "$ACTUAL_SHA256" != "$BUNDLE_SHA256" ]; then
+    echo "ERROR: zonemta bundle sha256 不匹配"
+    echo "  期望: $BUNDLE_SHA256"
+    echo "  实际: $ACTUAL_SHA256"
+    rm -f "$BUNDLE_TAR"
+    echo 'CONFIGURE_FAIL_42' > /tmp/configure.result
+    exit 42
+fi
+echo "Bundle sha256 校验通过"
+
+rm -rf "$APP" /tmp/zonemta-bundle /tmp/zonemta-extract
+mkdir -p /tmp/zonemta-extract
+if ! tar -xzf "$BUNDLE_TAR" -C /tmp/zonemta-extract; then
+    echo "ERROR: zonemta bundle 解压失败"
+    rm -f "$BUNDLE_TAR"
+    echo 'CONFIGURE_FAIL_42' > /tmp/configure.result
+    exit 42
+fi
+rm -f "$BUNDLE_TAR" "$BUNDLE_PRELOADED"
+if [ -d /tmp/zonemta-extract/zonemta-bundle ]; then
+    mv /tmp/zonemta-extract/zonemta-bundle "$APP"
+elif [ -f /tmp/zonemta-extract/index.js ]; then
+    mv /tmp/zonemta-extract "$APP"
+else
+    echo "ERROR: bundle 顶层不是 zonemta-bundle/ 或 index.js"
+    ls -la /tmp/zonemta-extract >&2 || true
+    echo 'CONFIGURE_FAIL_42' > /tmp/configure.result
+    exit 42
+fi
+rm -rf /tmp/zonemta-extract
+
+if [ ! -f "$APP/index.js" ] || [ ! -d "$APP/node_modules/@zone-eu/zone-mta" ]; then
+    echo "ERROR: 缺少 @zone-eu/zone-mta"
+    echo 'CONFIGURE_FAIL_42' > /tmp/configure.result
+    exit 42
+fi
+
+mkdir -p "$APP/plugins" "$APP/plugins/data" "$APP/logs" "$APP/config/plugins" "$APP/config/interfaces" "$APP/config/zones" "$APP/keys"
+
+cat > "$APP/config/zonemta.toml" << 'EOF'
+name = ""
+ident = "zone-mta"
+pluginsPath = "./plugins"
+corePluginsPath = "./node_modules/@zone-eu/zone-mta/plugins/"
+[log]
+level = "info"
+[dbs]
+mongo = "mongodb://127.0.0.1:27017/zone-mta"
+redis = "redis://127.0.0.1:6379/2"
+sender = "zone-mta"
+[queue]
+instanceId = "default"
+collection = "zone-queue"
+gfs = "mail"
+[api]
+port = 12080
+[smtpInterfaces]
+# @include "interfaces/*.toml"
+[plugins]
+# @include "plugins/*.toml"
+[zones]
+# @include "zones/*.toml"
+EOF
+
+cat > "$APP/config/interfaces/feeder.toml" << 'EOF'
+[feeder]
+enabled = true
+processes = 1
+maxSize = 20971520
+host = "127.0.0.1"
+port = 587
+authentication = true
+maxRecipients = 1000
+starttls = false
+secure = false
+key = "/opt/zone-mta/keys/privkey.pem"
+cert = "/opt/zone-mta/keys/fullchain.pem"
+EOF
+
+cat > "$APP/config/zones/default.toml" << 'EOF'
+[default]
+processes = 1
+connections = 5
+pool = ""
+EOF
+
+cat > "$APP/config/plugins/default-headers.toml" << 'EOF'
+["core/default-headers"]
+enabled = ["receiver", "main", "sender"]
+addMissing = ["message-id", "date"]
+futureDate = false
+xOriginatingIP = false
+EOF
+
+cat > "$APP/config/plugins/log_delivered.toml" << 'EOF'
+["log_delivered"]
+enabled = ["receiver", "main", "sender"]
+selector = "{{DKIM_SELECTOR}}"
+domain = "{{FULL_DOMAIN}}"
+smtp_user = "{{SUBDOMAIN}}@{{FULL_DOMAIN}}"
+email_pass = "{{EMAIL_PASS}}"
+EOF
+
+cat > "$APP/config/plugins/pmta_header_align.toml" << 'EOF'
+["pmta_header_align"]
+enabled = ["receiver", "main", "sender"]
+EOF
+
+cat > "$APP/config/plugins/pmta_verp.toml" << 'EOF'
+["pmta_verp"]
+enabled = ["receiver", "main", "sender"]
+EOF
+
+cat > "$APP/config/plugins/pmta_feeder_auth.toml" << EOF
+["pmta_feeder_auth"]
+enabled = ["receiver"]
+interfaces = ["feeder"]
+username = "{{SUBDOMAIN}}@{{FULL_DOMAIN}}"
+password = "{{EMAIL_PASS}}"
+EOF
+
+cat > "$APP/config/plugins/dkim.toml" << EOF
+["core/dkim"]
+enabled = ["sender"]
+domain = "{{FULL_DOMAIN}}"
+signTransportDomain = false
+selector = "{{DKIM_SELECTOR}}"
+path = "/opt/zone-mta/keys/dkim-private.pem"
+headerFields = []
+additionalHeaderFields = []
+addSignatureTimestamp = true
+signatureExpireIn = 0
+EOF
+
+cat > "$APP/config/plugins/zonemta-limiter.toml" << 'EOF'
+["modules/zonemta-limiter"]
+enabled = false
+EOF
+
+cat > "$APP/config/plugins/avast.toml" << 'EOF'
+["modules/zonemta-avast"]
+enabled = false
+EOF
+
+cat > "$APP/config/plugins/email-bounce.toml" << 'EOF'
+["core/email-bounce"]
+enabled = false
+EOF
+
+cat > "$APP/config/plugins/image-hashes.toml" << 'EOF'
+["core/image-hashes"]
+enabled = false
+EOF
+
+cat > "$APP/plugins/pmta_header_align.js" << 'JSEOF'
+'use strict';
+module.exports.title = 'PMTA header align';
+const STRIP = [
+    'received','x-virtual-mta','x-job','return-path','x-originating-ip',
+    'x-php-script','x-php-originating-script','user-agent','x-msmail-priority',
+    'x-mimeole','x-sender','x-antiabuse','x-source','x-source-args','x-source-dir',
+    'x-haraka','x-haraka-uuid','x-haraka-transaction','x-sending-zone','x-zonemta-queue-id'
+];
+function stripHeaders(headers) {
+    if (!headers || typeof headers.remove !== 'function') return;
+    for (const name of STRIP) {
+        try { headers.remove(name); } catch (e) {}
+    }
+}
+module.exports.init = (app, done) => {
+    app.addHook('message:headers', (envelope, messageInfo, next) => {
+        try { stripHeaders(envelope && envelope.headers); } catch (e) {}
+        next();
+    });
+    app.addHook('sender:headers', (delivery, connection, next) => {
+        try { stripHeaders(delivery && delivery.headers); } catch (e) {}
+        next();
+    });
+    done();
+};
+JSEOF
+
+cat > "$APP/plugins/pmta_verp.js" << 'JSEOF'
+'use strict';
+module.exports.title = 'PMTA VERP';
+function encodeRecipient(addr) {
+    let out = '';
+    for (const ch of String(addr || '')) {
+        if (ch === '@') out += '=';
+        else if (/[0-9A-Za-z.]/.test(ch)) out += ch;
+        else {
+            const hex = ch.charCodeAt(0).toString(16).toUpperCase();
+            out += '+' + (hex.length < 2 ? '0' + hex : hex);
+        }
+    }
+    return out;
+}
+function applyVerp(envelope) {
+    if (!envelope) return;
+    const from = String(envelope.from || '');
+    const at = from.lastIndexOf('@');
+    if (at <= 0) return;
+    const user = from.slice(0, at);
+    const host = from.slice(at + 1);
+    if (!user || !host || user.includes('=')) return;
+    const rcpt = String([].concat(envelope.to || [])[0] || '');
+    if (!rcpt || rcpt === '<>') return;
+    envelope.from = user + '-' + encodeRecipient(rcpt) + '@' + host;
+}
+module.exports.init = (app, done) => {
+    app.addHook('message:headers', (envelope, messageInfo, next) => {
+        try { applyVerp(envelope); } catch (e) {}
+        next();
+    });
+    app.addHook('sender:headers', (delivery, connection, next) => {
+        try { if (delivery && delivery.envelope) applyVerp(delivery.envelope); } catch (e) {}
+        next();
+    });
+    done();
+};
+JSEOF
+
+cat > "$APP/plugins/pmta_feeder_auth.js" << 'JSEOF'
+'use strict';
+module.exports.title = 'PMTA feeder AUTH';
+module.exports.init = (app, done) => {
+    const username = String((app.config && app.config.username) || '').trim();
+    const password = String((app.config && app.config.password) || '');
+    app.addHook('smtp:auth', (auth, session, next) => {
+        const interfaces = (app.config && app.config.interfaces) || ['feeder'];
+        if (session && session.interface && !interfaces.includes(session.interface)) return next();
+        if (username && auth && auth.username === username && auth.password === password) return next();
+        const err = new Error('Authentication failed');
+        err.responseCode = 535;
+        return next(err);
+    });
+    done();
+};
+JSEOF
+
+base64 -d > "$APP/plugins/log_delivered.js" << 'EOF'
+{{PLUGIN_LOG_DELIVERED_B64}}
+EOF
+
+base64 -d > "$APP/keys/fullchain.pem" << 'EOF'
+{{TLS_FULLCHAIN_B64}}
+EOF
+base64 -d > "$APP/keys/privkey.pem" << 'EOF'
+{{TLS_PRIVKEY_B64}}
+EOF
+base64 -d > "$APP/keys/dkim-private.pem" << 'EOF'
+{{DKIM_PRIVATE_B64}}
+EOF
+chmod 600 "$APP/keys/privkey.pem" "$APP/keys/dkim-private.pem"
+chmod 644 "$APP/keys/fullchain.pem"
+
+cat > /etc/systemd/system/zonemta.service << EOF
+[Unit]
+Description=ZonePMTA (ZoneMTA)
+After=network.target mongod.service redis-server.service redis.service
+Wants=mongod.service redis-server.service
+
+[Service]
+Environment=NODE_ENV=production
+WorkingDirectory=/opt/zone-mta
+ExecStart=${NODE_BIN} --max-old-space-size=2048 index.js --config=/opt/zone-mta/config/zonemta.toml
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sleep 2
+systemctl daemon-reload
+systemctl enable zonemta
+systemctl restart zonemta
+sleep 3
+if ! systemctl is-active --quiet zonemta; then
+    echo "ERROR: zonemta 未能启动"
+    journalctl -u zonemta -n 40 --no-pager || true
+    echo 'CONFIGURE_FAIL_42' > /tmp/configure.result
+    exit 42
+fi
+
+echo 'CONFIGURE_OK' > /tmp/configure.result
+echo CONFIGURE_OK
