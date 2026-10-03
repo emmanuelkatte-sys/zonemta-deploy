@@ -1,4 +1,4 @@
 # ZonePMTA bundle. SHA256 is the local tar; frozen EXE uses BUNDLE_URL.
 # BUNDLE_BUNDLED='zonemta-bundle-v1.4.tar.gz'
-BUNDLE_SHA256='e4dfd218ea97fc3e202f16303e9949f43439f48897f2d405e448bcd3ad93e0b1'
+BUNDLE_SHA256='4b3b5316d32c88f24a3744ad8c34d0e27c37237b7d6003a7f37b4918b758aef9'
 BUNDLE_URL='https://github.com/hi30998946/warship/releases/download/v1.4/zonemta-bundle-v1.4.tar.gz'
